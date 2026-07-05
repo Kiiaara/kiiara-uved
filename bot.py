@@ -2,9 +2,9 @@
 import asyncio
 import logging
 import os
+import random
 import signal
 import time
-from datetime import datetime, timezone
 
 import aiohttp
 from aiogram import Bot
@@ -22,6 +22,17 @@ OFFLINE_THRESHOLD = 2
 
 # Размер картинки-превью, который подставляем в thumbnail_url вместо {width}x{height}
 PREVIEW_SIZE = "1280x720"
+
+# Варианты текста уведомления о старте - бот берёт случайный при каждом стриме.
+# {url} подставляется ссылкой на канал.
+ONLINE_TEXTS = [
+    "🔴 Погнали! Я в эфире, залетайте → {url}",
+    "🔴 Стрим подрубила! Врывайтесь → {url}",
+    "🔴 Я онлайн, го смотреть → {url}",
+    "🔴 Начали! Жду вас на стриме → {url}",
+    "🔴 Эфир пошёл, заходите → {url}",
+    "🔴 Всё, стримлю! Залетайте в гости → {url}",
+]
 
 
 def _setup_logging() -> None:
@@ -44,24 +55,10 @@ def _parse_chat_ids(raw: str) -> list[int]:
     return out
 
 
-def _format_duration(started_at_iso: str) -> str:
-    """ISO8601 от Twitch -> 'HH:MM' длительности от старта до now."""
-    started = datetime.fromisoformat(started_at_iso.replace("Z", "+00:00"))
-    delta = datetime.now(timezone.utc) - started
-    total_minutes = int(delta.total_seconds() // 60)
-    hours, minutes = divmod(total_minutes, 60)
-    return f"{hours:02d}:{minutes:02d}"
-
-
-def _msg_online(stream: dict, login: str) -> str:
-    title = stream.get("title") or "(без названия)"
-    game = stream.get("game_name") or "—"
-    return (
-        f"🔴 Я в эфире!\n"
-        f"<b>{_escape(title)}</b>\n"
-        f"Категория: {_escape(game)}\n"
-        f"https://twitch.tv/{login}"
-    )
+def _msg_online(login: str) -> str:
+    """Случайный текст из ONLINE_TEXTS с подставленной ссылкой."""
+    url = f"https://twitch.tv/{login}"
+    return random.choice(ONLINE_TEXTS).format(url=url)
 
 
 def _preview_url(stream: dict) -> str | None:
@@ -78,23 +75,6 @@ def _preview_url(stream: dict) -> str | None:
     url = tpl.replace("{width}x{height}", PREVIEW_SIZE)
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}t={int(time.time())}"
-
-
-def _msg_offline(prev_state: dict, login: str) -> str:
-    title = prev_state.get("title") or "(без названия)"
-    started_at = prev_state.get("started_at")
-    duration = _format_duration(started_at) if started_at else "—"
-    return (
-        f"⚫ Стрим завершён\n"
-        f"Длительность: {duration}\n"
-        f"Был стрим: <b>{_escape(title)}</b>\n"
-        f"https://twitch.tv/{login}"
-    )
-
-
-def _escape(s: str) -> str:
-    """Минимальный HTML-escape для parse_mode=HTML."""
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 async def tick(twitch: TwitchClient, notifier: Notifier, login: str, preview_delay: int) -> None:
@@ -119,9 +99,6 @@ async def tick(twitch: TwitchClient, notifier: Notifier, login: str, preview_del
             state.update({
                 "is_live": True,
                 "stream_id": new_stream_id,
-                "started_at": stream.get("started_at"),
-                "title": stream.get("title"),
-                "game_name": stream.get("game_name"),
                 "offline_misses": 0,
             })
             save_state(state)
@@ -134,49 +111,35 @@ async def tick(twitch: TwitchClient, notifier: Notifier, login: str, preview_del
                 try:
                     fresh = await twitch.get_stream(login)
                     if fresh and fresh.get("id") == new_stream_id:
-                        stream = fresh  # свежий title/game/thumbnail
-                        state.update({
-                            "title": stream.get("title"),
-                            "game_name": stream.get("game_name"),
-                        })
-                        save_state(state)
+                        stream = fresh  # свежий thumbnail
                 except Exception as e:
                     log.warning("Не смог обновить данные перед постом: %s", e)
 
             preview = _preview_url(stream)
-            caption = _msg_online(stream, login)
+            caption = _msg_online(login)
             if preview:
                 await notifier.broadcast_photo(preview, caption)
             else:
                 # Нет thumbnail - шлём текстом с авто-превью по ссылке
                 await notifier.broadcast(caption)
-            return
-        else:
-            # Уже онлайн, обновим title/game на случай смены категории во время стрима
-            state.update({
-                "title": stream.get("title"),
-                "game_name": stream.get("game_name"),
-                "offline_misses": 0,
-            })
+        # Уже онлайн (или только что отпостили) - обновим state, ничего не шлём
+        state["offline_misses"] = 0
         save_state(state)
         return
 
-    # stream is None - Helix говорит, что канал оффлайн
+    # stream is None - Helix говорит, что канал оффлайн.
+    # Завершение стрима подписчикам не постим, просто гасим флаг после подтверждения.
     if state["is_live"]:
         misses = state.get("offline_misses", 0) + 1
         if misses >= OFFLINE_THRESHOLD:
-            log.info("Стрим завершён (после %d оффлайн-тиков)", misses)
-            await notifier.broadcast(_msg_offline(state, login))
+            log.info("Стрим завершён (после %d оффлайн-тиков), уведомление не шлю", misses)
             state.update({
                 "is_live": False,
                 "stream_id": None,
-                "started_at": None,
-                "title": None,
-                "game_name": None,
                 "offline_misses": 0,
             })
         else:
-            # Один промах - ждём следующий тик, не шлём пока
+            # Один промах - ждём следующий тик
             state["offline_misses"] = misses
             log.debug("Оффлайн-промах %d/%d, жду подтверждения", misses, OFFLINE_THRESHOLD)
         save_state(state)

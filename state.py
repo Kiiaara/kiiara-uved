@@ -9,9 +9,6 @@ STATE_FILE = Path(__file__).parent / "state.json"
 DEFAULT_STATE = {
     "is_live": False,
     "stream_id": None,
-    "started_at": None,
-    "title": None,
-    "game_name": None,
     "offline_misses": 0,  # счётчик подряд оффлайн-тиков для защиты от флапа
 }
 
