@@ -10,6 +10,7 @@ DEFAULT_STATE = {
     "is_live": False,
     "stream_id": None,
     "offline_misses": 0,  # счётчик подряд оффлайн-тиков для защиты от флапа
+    "sent_messages": [],  # [{chat_id, message_id}] постов о старте - удаляем при завершении
 }
 
 

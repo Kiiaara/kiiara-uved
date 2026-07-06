@@ -154,27 +154,32 @@ async def tick(
 
             preview_url = _preview_url(stream)
             caption = _msg_online(login)
+            stream_url = f"https://twitch.tv/{login}"
             photo_bytes = await _fetch_preview(session, preview_url) if preview_url else None
             if photo_bytes:
-                await notifier.broadcast_photo(photo_bytes, caption)
+                sent = await notifier.broadcast_photo(photo_bytes, caption, stream_url)
             else:
                 # Нет/не скачался кадр - шлём текстом (без link-preview, чтоб не вылезла аватарка)
-                await notifier.broadcast(caption)
+                sent = await notifier.broadcast(caption, stream_url)
+            # Запоминаем отправленные посты, чтобы удалить их при завершении стрима
+            state["sent_messages"] = sent
         # Уже онлайн (или только что отпостили) - обновим state, ничего не шлём
         state["offline_misses"] = 0
         save_state(state)
         return
 
     # stream is None - Helix говорит, что канал оффлайн.
-    # Завершение стрима подписчикам не постим, просто гасим флаг после подтверждения.
+    # При подтверждённом завершении удаляем посты о старте (самоудаляющееся уведомление).
     if state["is_live"]:
         misses = state.get("offline_misses", 0) + 1
         if misses >= OFFLINE_THRESHOLD:
-            log.info("Стрим завершён (после %d оффлайн-тиков), уведомление не шлю", misses)
+            log.info("Стрим завершён (после %d оффлайн-тиков), удаляю посты", misses)
+            await notifier.delete_messages(state.get("sent_messages", []))
             state.update({
                 "is_live": False,
                 "stream_id": None,
                 "offline_misses": 0,
+                "sent_messages": [],
             })
         else:
             # Один промах - ждём следующий тик
