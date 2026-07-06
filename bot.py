@@ -91,7 +91,30 @@ def _preview_url(stream: dict) -> str | None:
     return f"{url}{sep}t={int(time.time())}"
 
 
-async def tick(twitch: TwitchClient, notifier: Notifier, login: str, preview_delay: int) -> None:
+async def _fetch_preview(session: aiohttp.ClientSession, url: str) -> bytes | None:
+    """Скачивает кадр превью с Twitch. None - если не вышло (шлём тогда текстом)."""
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                log.warning("Превью недоступно, HTTP %s", resp.status)
+                return None
+            data = await resp.read()
+            if not data:
+                log.warning("Превью пустое")
+                return None
+            return data
+    except Exception as e:
+        log.warning("Не смог скачать превью: %s", e)
+        return None
+
+
+async def tick(
+    session: aiohttp.ClientSession,
+    twitch: TwitchClient,
+    notifier: Notifier,
+    login: str,
+    preview_delay: int,
+) -> None:
     """Один цикл проверки: сравниваем Twitch с локальным state и шлём дельту."""
     state = load_state()
 
@@ -129,12 +152,13 @@ async def tick(twitch: TwitchClient, notifier: Notifier, login: str, preview_del
                 except Exception as e:
                     log.warning("Не смог обновить данные перед постом: %s", e)
 
-            preview = _preview_url(stream)
+            preview_url = _preview_url(stream)
             caption = _msg_online(login)
-            if preview:
-                await notifier.broadcast_photo(preview, caption)
+            photo_bytes = await _fetch_preview(session, preview_url) if preview_url else None
+            if photo_bytes:
+                await notifier.broadcast_photo(photo_bytes, caption)
             else:
-                # Нет thumbnail - шлём текстом с авто-превью по ссылке
+                # Нет/не скачался кадр - шлём текстом (без link-preview, чтоб не вылезла аватарка)
                 await notifier.broadcast(caption)
         # Уже онлайн (или только что отпостили) - обновим state, ничего не шлём
         state["offline_misses"] = 0
@@ -205,7 +229,7 @@ async def main() -> None:
             notifier = Notifier(bot, chat_ids)
             while not stop_event.is_set():
                 try:
-                    await tick(twitch, notifier, login, preview_delay)
+                    await tick(session, twitch, notifier, login, preview_delay)
                 except Exception as e:
                     # Никаких неперехваченных исключений в основной петле
                     log.exception("Ошибка в tick: %s", e)
